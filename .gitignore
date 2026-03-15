@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+
+# Training artifacts (large files — store elsewhere)
+checkpoints/
+outputs/
+logs/
+
+# Dataset and features (stored in Google Drive)
+../DCASE2025_SELD_dataset/
+features/
+
+# Executed notebook (contains embedded PNGs, use visualize.ipynb instead)
+visualize_executed.ipynb
+
+# macOS
+.DS_Store
