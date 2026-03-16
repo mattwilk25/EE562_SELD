@@ -1,189 +1,159 @@
-"""
-main.py
+"""main.py — baseline CRNN training pipeline."""
 
-This is the entry point for the project. It orchestrates the training pipeline,
-including data preparation, model training, and evaluation.
-
-Author: Parthasaarathy Sudarsanam, Audio Research Group, Tampere University
-Date: January 2025
-"""
-
-import os.path
-import torch
-from parameters import params
-from model import SELDModel
-from loss import SELDLossADPIT, SELDLossSingleACCDOA
-from metrics import ComputeSELDResults
-from data_generator import DataGenerator
-from torch.utils.data import DataLoader
-from extract_features import SELDFeatureExtractor
-from tqdm import tqdm
-import utils
+import os
 import pickle
+import torch
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+
+from model import CRNNBaseline
+from loss import ADPITLoss
+from metrics import ComputeSELDResults
+from data_generator import SELDDataset
+from extract_features import AudioFeatureExtractor
+import utils
+
+params = {
+    # paths
+    'net_type':        'SELDnet',
+    'root_dir':        '../DCASE2025_SELD_dataset',
+    'feat_dir':        '../DCASE2025_SELD_dataset/features',
+    'log_dir':         'logs',
+    'checkpoints_dir': 'checkpoints',
+    'output_dir':      'outputs',
+    # audio features
+    'sampling_rate':   24000,
+    'hop_length_s':    0.02,
+    'nb_mels':         64,
+    # model
+    'nb_conv_blocks':  3,
+    'nb_conv_filters': 64,
+    'f_pool_size':     [4, 4, 2],
+    't_pool_size':     [5, 1, 1],
+    'dropout':         0.05,
+    'rnn_size':        128,
+    'nb_rnn_layers':   2,
+    'nb_self_attn_layers': 2,
+    'nb_attn_heads':   8,
+    'nb_fnn_layers':   1,
+    'fnn_size':        128,
+    # output
+    'max_polyphony':   3,
+    'nb_classes':      13,
+    'label_sequence_length': 50,
+    'thresh_unify':    15,
+    # training
+    'nb_epochs':       200,
+    'batch_size':      256,
+    'nb_workers':      0,
+    'shuffle':         True,
+    'learning_rate':   1e-3,
+    'weight_decay':    0,
+    'dev_train_folds': ['fold3'],
+    'dev_test_folds':  ['fold4'],
+    # eval
+    'average':         'macro',
+    'lad_doa_thresh':  20,
+    'lad_dist_thresh': float('inf'),
+    'lad_reldist_thresh': 1.0,
+    'lad_req_onscreen': False,
+    'use_jackknife':   False,
+}
+
+VAL_INTERVAL = 5
 
 
-def train_epoch(seld_model, dev_train_iterator, optimizer, seld_loss):
-
-    seld_model.train()
-    train_loss_per_epoch = 0  # Track loss per iteration to average over the epoch.
-
-    for i, (input_features, labels) in enumerate(tqdm(dev_train_iterator, desc="Train", leave=False)):
+def train_epoch(model, loader, optimizer, criterion):
+    model.train()
+    total_loss = 0
+    for audio, labels in tqdm(loader, desc='Train', leave=False):
+        audio, labels = audio.to(device), labels.to(device)
         optimizer.zero_grad()
-        labels = labels.to(device)
-        # Handling modalities
-        if params['modality'] == 'audio':
-            audio_features, video_features = input_features.to(device), None
-        elif params['modality'] == 'audio_visual':
-            audio_features, video_features = input_features[0].to(device), input_features[1].to(device)
-        else:
-            raise AssertionError("Modality should be one of 'audio' or 'audio_visual'.")
-
-        # Forward pass
-        logits = seld_model(audio_features, video_features)
-
-        # Compute loss and back propagate
-        loss = seld_loss(logits, labels)
+        loss = criterion(model(audio), labels)
         loss.backward()
         optimizer.step()
-
-        # Track loss
-        train_loss_per_epoch += loss.item()
-
-    avg_train_loss = train_loss_per_epoch / len(dev_train_iterator)
-    return avg_train_loss
+        total_loss += loss.item()
+    return total_loss / len(loader)
 
 
-def val_epoch(seld_model, dev_test_iterator, seld_loss, seld_metrics, output_dir, is_jackknife=False):
-
-    seld_model.eval()
-    val_loss_per_epoch = 0  # Track loss per iteration to average over the epoch.
+def val_epoch(model, loader, criterion, scorer, output_dir):
+    model.eval()
+    total_loss = 0
     with torch.no_grad():
-        for j, (input_features, labels) in enumerate(tqdm(dev_test_iterator, desc="Val", leave=False)):
-            labels = labels.to(device)
-
-            # Handling modalities
-            if params['modality'] == 'audio':
-                audio_features, video_features = input_features.to(device), None
-            elif params['modality'] == 'audio_visual':
-                audio_features, video_features = input_features[0].to(device), input_features[1].to(device)
-            else:
-                raise AssertionError("Modality should be one of 'audio' or 'audio_visual'.")
-
-            # Forward pass
-            logits = seld_model(audio_features, video_features)
-
-            # Compute loss
-            loss = seld_loss(logits, labels)
-            val_loss_per_epoch += loss.item()
-
-            # save predictions to csv files for metric calculations
-            utils.write_logits_to_dcase_format(logits, params, output_dir, dev_test_iterator.dataset.label_files[j * params['batch_size']: (j + 1) * params['batch_size']])
-        avg_val_loss = val_loss_per_epoch / len(dev_test_iterator)
-
-        metric_scores = seld_metrics.get_SELD_Results(pred_files_path=os.path.join(output_dir, 'dev-test'), is_jackknife=is_jackknife)
-
-        return avg_val_loss, metric_scores
+        for j, (audio, labels) in enumerate(tqdm(loader, desc='Val', leave=False)):
+            audio, labels = audio.to(device), labels.to(device)
+            logits = model(audio)
+            total_loss += criterion(logits, labels).item()
+            utils.write_logits_to_dcase_format(
+                logits, params, output_dir,
+                loader.dataset.label_files[j * params['batch_size']: (j + 1) * params['batch_size']]
+            )
+    scores = scorer.get_SELD_Results(os.path.join(output_dir, 'dev-test'))
+    return total_loss / len(loader), scores
 
 
 def main():
-
+    global params
     if restore_from_checkpoint:
-        print('Loading params from the initial checkpoint')
-        params_file = os.path.join(initial_checkpoint_path, 'config.pkl')
-        f = open(params_file, "rb")
-        loaded_params = pickle.load(f)
-        params.clear()  # Clear the original params
-        params.update(loaded_params)
+        with open(os.path.join(checkpoint_path, 'config.pkl'), 'rb') as f:
+            params = pickle.load(f)
 
-    # Set up directories for storing model checkpoints, predictions(output_dir), and create a summary writer
-    checkpoints_folder, output_dir, summary_writer = utils.setup(params)
+    ckpt_dir, out_dir, _ = utils.setup(params)
 
-    # Feature extraction code.
-    feature_extractor = SELDFeatureExtractor(params)
-    feature_extractor.extract_features(split='dev')
-    feature_extractor.extract_labels(split='dev')
+    extractor = AudioFeatureExtractor(params)
+    extractor.extract_features('dev')
+    extractor.extract_labels('dev')
 
-    # Set up dev_train and dev_test data iterator
-    print("Building train dataset...", flush=True)
-    dev_train_dataset = DataGenerator(params=params, mode='dev_train')
-    dev_train_iterator = DataLoader(dataset=dev_train_dataset, batch_size=params['batch_size'], num_workers=params['nb_workers'], shuffle=params['shuffle'], drop_last=True)
-    print(f"  Train: {len(dev_train_dataset)} clips, {len(dev_train_iterator)} batches", flush=True)
+    print('Building datasets...')
+    train_loader = DataLoader(SELDDataset(params, 'train'), batch_size=params['batch_size'],
+                              num_workers=params['nb_workers'], shuffle=params['shuffle'], drop_last=True)
+    val_loader   = DataLoader(SELDDataset(params, 'test'),  batch_size=params['batch_size'],
+                              num_workers=params['nb_workers'], shuffle=False, drop_last=False)
+    print(f'  Train: {len(train_loader.dataset)} clips | Val: {len(val_loader.dataset)} clips')
 
-    print("Building test dataset...", flush=True)
-    dev_test_dataset = DataGenerator(params=params, mode='dev_test')
-    dev_test_iterator = DataLoader(dataset=dev_test_dataset, batch_size=params['batch_size'], num_workers=params['nb_workers'], shuffle=False, drop_last=False)
-    print(f"  Test:  {len(dev_test_dataset)} clips, {len(dev_test_iterator)} batches", flush=True)
+    model     = CRNNBaseline(params).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=params['learning_rate'],
+                                 weight_decay=params['weight_decay'])
+    criterion = ADPITLoss().to(device)
+    scorer    = ComputeSELDResults(params, ref_files_folder=os.path.join(params['root_dir'], 'metadata_dev'))
 
-    # create model, optimizer, loss and metrics
-    print("Building model...", flush=True)
-    seld_model = SELDModel(params=params).to(device)
-    print(f"  Device: {device}", flush=True)
-    optimizer = torch.optim.Adam(params=seld_model.parameters(), lr=params['learning_rate'], weight_decay=params['weight_decay'])
+    print(f'Parameters: {sum(p.numel() for p in model.parameters()):,} | Device: {device}')
 
-    if params['multiACCDOA']:
-        seld_loss = SELDLossADPIT(params=params).to(device)
-    else:
-        seld_loss = SELDLossSingleACCDOA(params=params).to(device)
-
-    seld_metrics = ComputeSELDResults(params=params, ref_files_folder=os.path.join(params['root_dir'], 'metadata_dev'))
-
-    start_epoch = 0
-    best_f_score = float('-inf')
-
+    start_epoch, best_f = 0, float('-inf')
     if restore_from_checkpoint:
-        print('Loading model weights and optimizer state dict from initial checkpoint...')
-        model_ckpt = torch.load(os.path.join(initial_checkpoint_path, 'best_model.pth'), map_location=device, weights_only=False)
-        seld_model.load_state_dict(model_ckpt['seld_model'])
-        optimizer.load_state_dict(model_ckpt['opt'])
-        start_epoch = model_ckpt['epoch'] + 1
-        best_f_score = model_ckpt['best_f_score']
-
-    VAL_INTERVAL = 5  # run full validation every N epochs
+        ckpt = torch.load(os.path.join(checkpoint_path, 'best_model.pth'),
+                          map_location=device, weights_only=False)
+        model.load_state_dict(ckpt['model'])
+        optimizer.load_state_dict(ckpt['opt'])
+        start_epoch, best_f = ckpt['epoch'] + 1, ckpt['best_f']
 
     for epoch in range(start_epoch, params['nb_epochs']):
-        # ------------- Training -------------- #
-        avg_train_loss = train_epoch(seld_model, dev_train_iterator, optimizer, seld_loss)
+        train_loss = train_epoch(model, train_loader, optimizer, criterion)
 
-        # ------------- Validation (every VAL_INTERVAL epochs) -------------- #
         if (epoch + 1) % VAL_INTERVAL == 0 or epoch == params['nb_epochs'] - 1:
-            avg_val_loss, metric_scores = val_epoch(seld_model, dev_test_iterator, seld_loss, seld_metrics, output_dir)
-            val_f, val_ang_error, val_dist_error, val_rel_dist_error, val_onscreen_acc, class_wise_scr = metric_scores
-            print(
-                f"Epoch {epoch + 1}/{params['nb_epochs']} | "
-                f"Train Loss: {avg_train_loss:.2f} | "
-                f"Val Loss: {avg_val_loss:.2f} | "
-                f"F-score: {val_f * 100:.2f} | "
-                f"Ang Err: {val_ang_error:.2f} | "
-                f"Dist Err: {val_dist_error:.2f} | "
-                f"Rel Dist Err: {val_rel_dist_error:.2f}" +
-                (f" | On-Screen Acc: {val_onscreen_acc:.2f}" if params['modality'] == 'audio_visual' else "")
-            )
+            val_loss, (f, ang, dist, *_) = val_epoch(model, val_loader, criterion, scorer, out_dir)
+            print(f"Epoch {epoch+1}/{params['nb_epochs']} | "
+                  f"Train: {train_loss:.3f} | Val: {val_loss:.3f} | "
+                  f"F: {f*100:.1f}% | DOA: {ang:.1f}° | Dist: {dist:.2f}", flush=True)
         else:
-            val_f = float('-inf')  # skip save on non-validation epochs
-            print(f"Epoch {epoch + 1}/{params['nb_epochs']} | Train Loss: {avg_train_loss:.2f}", flush=True)
+            f = float('-inf')
+            print(f"Epoch {epoch+1}/{params['nb_epochs']} | Train: {train_loss:.3f}", flush=True)
 
-        # ------------- Save model if validation f score improves -------------#
-        if val_f > best_f_score:
-            best_f_score = val_f
-            net_save = {'seld_model': seld_model.state_dict(), 'opt': optimizer.state_dict(), 'epoch': epoch,
-                        'best_f_score': best_f_score, 'best_ang_err': val_ang_error, 'best_rel_dist_err': val_rel_dist_error}
-            if params['modality'] == 'audio_visual':
-                net_save['best_onscreen_acc'] = val_onscreen_acc
-            torch.save(net_save, checkpoints_folder + "/best_model.pth")
+        if f > best_f:
+            best_f = f
+            torch.save({'model': model.state_dict(), 'opt': optimizer.state_dict(),
+                        'epoch': epoch, 'best_f': best_f},
+                       os.path.join(ckpt_dir, 'best_model.pth'))
 
-    # Evaluate the best model on dev-test.
-    best_model_ckpt = torch.load(os.path.join(checkpoints_folder, 'best_model.pth'), map_location=device, weights_only=False)
-    seld_model.load_state_dict(best_model_ckpt['seld_model'])
-    use_jackknife = params['use_jackknife']
-    test_loss, test_metric_scores = val_epoch(seld_model, dev_test_iterator, seld_loss, seld_metrics, output_dir, is_jackknife=use_jackknife)
-    test_f, test_ang_error, test_dist_error, test_rel_dist_error, test_onscreen_acc, class_wise_scr = test_metric_scores
-    utils.print_results(test_f, test_ang_error, test_dist_error, test_rel_dist_error, test_onscreen_acc, class_wise_scr, params)
+    ckpt = torch.load(os.path.join(ckpt_dir, 'best_model.pth'), map_location=device, weights_only=False)
+    model.load_state_dict(ckpt['model'])
+    _, scores = val_epoch(model, val_loader, criterion, scorer, out_dir)
+    utils.print_results(*scores, params)
 
 
 if __name__ == '__main__':
-    device = 'cuda:0' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
+    device = ('cuda:0' if torch.cuda.is_available()
+              else 'mps' if torch.backends.mps.is_available() else 'cpu')
     restore_from_checkpoint = False
-    initial_checkpoint_path = 'checkpoints/SELDnet_audio_visual_multiACCDOA_20250331_173131'
-
+    checkpoint_path = 'checkpoints/SELDnet_20250331_152343'
     main()
-

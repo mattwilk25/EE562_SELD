@@ -1,780 +1,293 @@
-"""
-utils.py
-
-This module includes miscellaneous utility functions that support the project,
-such as data_preprocessing, logging, file handling, and general-purpose helpers.
-
-Author: Parthasaarathy Sudarsanam, Audio Research Group, Tampere University
-Date: February 2025
-"""
-
 import os
-from torch.utils.tensorboard import SummaryWriter
 import time
 import pickle
+import warnings
 import librosa
 import librosa.feature
 import numpy as np
-import cv2
-from PIL import Image
 import torch
 from scipy import stats
 from scipy.optimize import linear_sum_assignment
-import warnings
+from torch.utils.tensorboard import SummaryWriter
 
+
+# --------------------------------------------------------------------------- #
+# Training setup
+# --------------------------------------------------------------------------- #
 
 def setup(params):
-    """
-    Sets up the environment for training by creating directories for model checkpoints
-    and logging, saving configuration parameters, and initializing a tensorboard summary writer.
-    Args:
-        params (dict): Dictionary containing the configuration parameters.
-    Returns:
-        tuple: A tuple containing the path to the checkpoints folder, output folder and the tensorboard summary writer instance.
-    """
-
-    print('You are using the following configuration: \n\n')
-    for key, value in params.items():
-        print(key, ': ', value)
-
-    # create dir to save model checkpoints
-    reference = f"{params['net_type']}_{params['modality']}_{'multiACCDOA' if params['multiACCDOA'] else 'singleACCDOA'}{time.strftime('_%Y%m%d_%H%M%S')}"
-    checkpoints_dir = os.path.join(params['checkpoints_dir'], reference)
-    os.makedirs(checkpoints_dir, exist_ok=True)
-
-    # save the all the config/hyperparams to a pickle file
-    pickle_filepath = os.path.join(str(checkpoints_dir), 'config.pkl')
-    pickle_file = open(pickle_filepath, 'wb')
-    pickle.dump(params, pickle_file)
-
-    # create a tensorboard summary writer for logging and visualization
-    log_dir = os.path.join(params['log_dir'], reference)
-    os.makedirs(log_dir, exist_ok=True)
-    summary_writer = SummaryWriter(log_dir=str(log_dir))
-
-    # create output folder to save the predictions
-    output_dir = os.path.join(params['output_dir'], reference)
-    os.makedirs(output_dir, exist_ok=True)
-
-    return checkpoints_dir, output_dir, summary_writer
+    name = f"{params['net_type']}{time.strftime('_%Y%m%d_%H%M%S')}"
+    ckpt_dir = os.path.join(params['checkpoints_dir'], name)
+    out_dir  = os.path.join(params['output_dir'], name)
+    log_dir  = os.path.join(params['log_dir'], name)
+    for d in (ckpt_dir, out_dir, log_dir):
+        os.makedirs(d, exist_ok=True)
+    with open(os.path.join(ckpt_dir, 'config.pkl'), 'wb') as f:
+        pickle.dump(params, f)
+    return ckpt_dir, out_dir, SummaryWriter(log_dir=log_dir)
 
 
-def load_audio(audio_file, sampling_rate):
-    """
-    Loads an audio file.
-    Args:
-        audio_file (str): Path to the audio file.
-        sampling_rate (int): Target sampling rate
-    Returns:
-        tuple: (audio_data, sample_rate)
-    """
-    audio_data, sr = librosa.load(path=audio_file, sr=sampling_rate, mono=False)
-    return audio_data, sr
+# --------------------------------------------------------------------------- #
+# Audio feature extraction
+# --------------------------------------------------------------------------- #
+
+def load_audio(path, sr):
+    return librosa.load(path, sr=sr, mono=False)
 
 
-def extract_stft(audio, n_fft, hop_length, win_length):
-    stft = librosa.stft(y=audio, n_fft=n_fft, hop_length=hop_length, win_length=win_length).T
-    return stft
+def extract_log_mel_spectrogram(audio, sr, n_fft, hop, win, nb_mels):
+    stft    = librosa.stft(y=audio, n_fft=n_fft, hop_length=hop, win_length=win).T
+    mel     = librosa.feature.melspectrogram(S=np.abs(stft)**2, sr=sr, n_mels=nb_mels)
+    log_mel = librosa.power_to_db(mel).transpose((2, 0, 1))  # (2, T, F)
+    return log_mel
 
 
-def extract_log_mel_spectrogram(audio, sr, n_fft, hop_length, win_length, nb_mels):
-    """
-    Computes the log Mel spectrogram from an audio signal.
+# --------------------------------------------------------------------------- #
+# Label loading and processing
+# --------------------------------------------------------------------------- #
 
-    Parameters:
-        audio (ndarray): NumPy array containing the audio waveform.
-        sr (int): The sample rate of the audio signal.
-        n_fft (int): Size of the FFT window.
-        hop_length (int): Number of samples to shift between successive frames.
-        win_length (int): Length of each windowed frame in samples.
-        nb_mels (int): Number of Mel filter banks to use.
-
-    Returns:
-        ndarray: Array of shape (2, time_frames, nb_mels) - log Mel spectrogram for each channel.
-    """
-
-    linear_stft = extract_stft(audio, n_fft, hop_length, win_length)
-    linear_stft_mag = np.abs(linear_stft) ** 2
-    mel_spec = librosa.feature.melspectrogram(S=linear_stft_mag, sr=sr, n_mels=nb_mels)
-    log_mel_spectrogram = librosa.power_to_db(mel_spec)
-    log_mel_spectrogram = log_mel_spectrogram.transpose((2, 0, 1))
-    return log_mel_spectrogram
-
-
-def load_video(video_file, fps):
-    """
-    Loads video frames from a video file.
-    Args:
-        video_file (str): Path to the video file.
-        fps (int): Target frames per second
-    Returns:
-        list: List of PIL images (frames).
-    """
-
-    cap = cv2.VideoCapture(video_file)
-    video_fps = 30
-    frame_interval = max(1, video_fps // fps)
-    pil_frames = []
-    frame_cnt = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame_cnt % frame_interval == 0:  # smoothening may not be required since we process the frames individually through a resnet
-            resized_frame = cv2.resize(frame, (360, 180))
-            frame_rgb = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB)
-            pil_frame = Image.fromarray(frame_rgb)
-            pil_frames.append(pil_frame)
-        frame_cnt += 1
-    cap.release()
-    return pil_frames
-
-
-def extract_resnet_features(video_frames, resnet_preprocessor, resnet_backbone, device):
-    """
-    Extracts ResNet-50 features from video frames.
-    Args:
-        video_frames (list): List of PIL video frames.
-        resnet_preprocessor (callable): Preprocessing function to prepare images for ResNet input.
-        resnet_backbone (torch.nn.Module): Pre-trained ResNet model to extract features.
-        device (str): Device to perform computation on (e.g., 'cuda' or 'cpu').
-    Returns:
-        tensor: Extracted video features of shape (nb_frames, 7 ,7)
-    """
-
-    with torch.no_grad():
-        preprocessed_images = [resnet_preprocessor(image) for image in video_frames]
-        preprocessed_images = torch.stack(preprocessed_images, dim=0).to(device)
-        vid_features = resnet_backbone(preprocessed_images)
-        vid_features = torch.mean(vid_features, dim=1)
-        return vid_features
-
-
-def load_labels(label_file, convert_to_cartesian=True):
-    label_data = {}
-    with open(label_file, 'r') as file:
-        lines = file.readlines()[1:]  # Skip the header
-        for line in lines:
-            values = line.strip().split(',')
-            frame_idx = int(values[0])
-            data_row = [int(values[1]), int(values[2]), float(values[3]), float(values[4]), int(values[5])]
-            if frame_idx not in label_data:
-                label_data[frame_idx] = []
-            label_data[frame_idx].append(data_row)
-
+def load_labels(path, convert_to_cartesian=True):
+    data = {}
+    with open(path) as f:
+        for line in f.readlines()[1:]:
+            p = line.strip().split(',')
+            frame = int(p[0])
+            data.setdefault(frame, []).append(
+                [int(p[1]), int(p[2]), float(p[3]), float(p[4]), int(p[5])]
+            )
     if convert_to_cartesian:
-        label_data = convert_polar_to_cartesian(label_data)
-    return label_data
+        data = _polar_to_cartesian(data)
+    return data
 
 
-def process_labels(_desc_file, _nb_label_frames, _nb_unique_classes):
-
-    se_label = torch.zeros((_nb_label_frames, _nb_unique_classes))
-    x_label = torch.zeros((_nb_label_frames, _nb_unique_classes))
-    y_label = torch.zeros((_nb_label_frames, _nb_unique_classes))
-    dist_label = torch.zeros((_nb_label_frames, _nb_unique_classes))
-    onscreen_label = torch.zeros((_nb_label_frames, _nb_unique_classes))
-
-    for frame_ind, active_event_list in _desc_file.items():
-        if frame_ind < _nb_label_frames:
-            for active_event in active_event_list:
-                se_label[frame_ind, active_event[0]] = 1
-                x_label[frame_ind, active_event[0]] = active_event[2]
-                y_label[frame_ind, active_event[0]] = active_event[3]
-                dist_label[frame_ind, active_event[0]] = active_event[4] / 100.
-                onscreen_label[frame_ind, active_event[0]] = active_event[5]
-
-    label_mat = torch.cat((se_label, x_label, y_label, dist_label, onscreen_label), dim=1)
-    return label_mat
+def _polar_to_cartesian(data):
+    out = {}
+    for frame, events in data.items():
+        out[frame] = []
+        for e in events:
+            az = e[2] * np.pi / 180
+            out[frame].append(e[:2] + [np.cos(az), np.sin(az)] + e[3:])
+    return out
 
 
-def process_labels_adpit(_desc_file, _nb_label_frames, _nb_unique_classes):
-
-    se_label = torch.zeros((_nb_label_frames, 6, _nb_unique_classes))  # 50, 6, 13
-    x_label = torch.zeros((_nb_label_frames, 6, _nb_unique_classes))
-    y_label = torch.zeros((_nb_label_frames, 6, _nb_unique_classes))
-    dist_label = torch.zeros((_nb_label_frames, 6, _nb_unique_classes))
-    onscreen_label = torch.zeros((_nb_label_frames, 6, _nb_unique_classes))
-
-    for frame_ind, active_event_list in _desc_file.items():
-        if frame_ind < _nb_label_frames:
-            active_event_list.sort(key=lambda x: x[0])  # sort for ov from the same class
-            active_event_list_per_class = []
-            for i, active_event in enumerate(active_event_list):
-                active_event_list_per_class.append(active_event)
-                if i == len(active_event_list) - 1:  # if the last
-                    if len(active_event_list_per_class) == 1:  # if no ov from the same class
-                        # a0----
-                        active_event_a0 = active_event_list_per_class[0]
-                        se_label[frame_ind, 0, active_event_a0[0]] = 1
-                        x_label[frame_ind, 0, active_event_a0[0]] = active_event_a0[2]
-                        y_label[frame_ind, 0, active_event_a0[0]] = active_event_a0[3]
-                        dist_label[frame_ind, 0, active_event_a0[0]] = active_event_a0[4] / 100.
-                        onscreen_label[frame_ind, 0, active_event_a0[0]] = active_event_a0[5]
-                    elif len(active_event_list_per_class) == 2:  # if ov with 2 sources from the same class
-                        # --b0--
-                        active_event_b0 = active_event_list_per_class[0]
-                        se_label[frame_ind, 1, active_event_b0[0]] = 1
-                        x_label[frame_ind, 1, active_event_b0[0]] = active_event_b0[2]
-                        y_label[frame_ind, 1, active_event_b0[0]] = active_event_b0[3]
-                        dist_label[frame_ind, 1, active_event_b0[0]] = active_event_b0[4] / 100.
-                        onscreen_label[frame_ind, 1, active_event_b0[0]] = active_event_b0[5]
-                        # --b1--
-                        active_event_b1 = active_event_list_per_class[1]
-                        se_label[frame_ind, 2, active_event_b1[0]] = 1
-                        x_label[frame_ind, 2, active_event_b1[0]] = active_event_b1[2]
-                        y_label[frame_ind, 2, active_event_b1[0]] = active_event_b1[3]
-                        dist_label[frame_ind, 2, active_event_b1[0]] = active_event_b1[4] / 100.
-                        onscreen_label[frame_ind, 2, active_event_b1[0]] = active_event_b1[5]
-
-                    else:  # if ov with more than 2 sources from the same class
-                        # ----c0
-                        active_event_c0 = active_event_list_per_class[0]
-                        se_label[frame_ind, 3, active_event_c0[0]] = 1
-                        x_label[frame_ind, 3, active_event_c0[0]] = active_event_c0[2]
-                        y_label[frame_ind, 3, active_event_c0[0]] = active_event_c0[3]
-                        dist_label[frame_ind, 3, active_event_c0[0]] = active_event_c0[4] / 100.
-                        onscreen_label[frame_ind, 3, active_event_c0[0]] = active_event_c0[5]
-
-                        # ----c1
-                        active_event_c1 = active_event_list_per_class[1]
-                        se_label[frame_ind, 4, active_event_c1[0]] = 1
-                        x_label[frame_ind, 4, active_event_c1[0]] = active_event_c1[2]
-                        y_label[frame_ind, 4, active_event_c1[0]] = active_event_c1[3]
-                        dist_label[frame_ind, 4, active_event_c1[0]] = active_event_c1[4] / 100.
-                        onscreen_label[frame_ind, 4, active_event_c1[0]] = active_event_c1[5]
-                        # ----c2
-                        active_event_c2 = active_event_list_per_class[2]
-                        se_label[frame_ind, 5, active_event_c2[0]] = 1
-                        x_label[frame_ind, 5, active_event_c2[0]] = active_event_c2[2]
-                        y_label[frame_ind, 5, active_event_c2[0]] = active_event_c2[3]
-                        dist_label[frame_ind, 5, active_event_c2[0]] = active_event_c2[4] / 100.
-                        onscreen_label[frame_ind, 5, active_event_c2[0]] = active_event_c2[5]
-
-                elif active_event[0] != active_event_list[i + 1][0]:  # if the next is not the same class
-                    if len(active_event_list_per_class) == 1:  # if no ov from the same class
-                        # a0----
-                        active_event_a0 = active_event_list_per_class[0]
-                        se_label[frame_ind, 0, active_event_a0[0]] = 1
-                        x_label[frame_ind, 0, active_event_a0[0]] = active_event_a0[2]
-                        y_label[frame_ind, 0, active_event_a0[0]] = active_event_a0[3]
-                        dist_label[frame_ind, 0, active_event_a0[0]] = active_event_a0[4] / 100.
-                        onscreen_label[frame_ind, 0, active_event_a0[0]] = active_event_a0[5]
-                    elif len(active_event_list_per_class) == 2:  # if ov with 2 sources from the same class
-                        # --b0--
-                        active_event_b0 = active_event_list_per_class[0]
-                        se_label[frame_ind, 1, active_event_b0[0]] = 1
-                        x_label[frame_ind, 1, active_event_b0[0]] = active_event_b0[2]
-                        y_label[frame_ind, 1, active_event_b0[0]] = active_event_b0[3]
-                        dist_label[frame_ind, 1, active_event_b0[0]] = active_event_b0[4] / 100.
-                        onscreen_label[frame_ind, 1, active_event_b0[0]] = active_event_b0[5]
-                        # --b1--
-                        active_event_b1 = active_event_list_per_class[1]
-                        se_label[frame_ind, 2, active_event_b1[0]] = 1
-                        x_label[frame_ind, 2, active_event_b1[0]] = active_event_b1[2]
-                        y_label[frame_ind, 2, active_event_b1[0]] = active_event_b1[3]
-                        dist_label[frame_ind, 2, active_event_b1[0]] = active_event_b1[4] / 100.
-                        onscreen_label[frame_ind, 2, active_event_b1[0]] = active_event_b1[5]
-                    else:  # if ov with more than 2 sources from the same class
-                        # ----c0
-                        active_event_c0 = active_event_list_per_class[0]
-                        se_label[frame_ind, 3, active_event_c0[0]] = 1
-                        x_label[frame_ind, 3, active_event_c0[0]] = active_event_c0[2]
-                        y_label[frame_ind, 3, active_event_c0[0]] = active_event_c0[3]
-                        dist_label[frame_ind, 3, active_event_c0[0]] = active_event_c0[4] / 100.
-                        onscreen_label[frame_ind, 3, active_event_c0[0]] = active_event_c0[5]
-                        # ----c1
-                        active_event_c1 = active_event_list_per_class[1]
-                        se_label[frame_ind, 4, active_event_c1[0]] = 1
-                        x_label[frame_ind, 4, active_event_c1[0]] = active_event_c1[2]
-                        y_label[frame_ind, 4, active_event_c1[0]] = active_event_c1[3]
-                        dist_label[frame_ind, 4, active_event_c1[0]] = active_event_c1[4] / 100.
-                        onscreen_label[frame_ind, 4, active_event_c1[0]] = active_event_c1[5]
-                        # ----c2
-                        active_event_c2 = active_event_list_per_class[2]
-                        se_label[frame_ind, 5, active_event_c2[0]] = 1
-                        x_label[frame_ind, 5, active_event_c2[0]] = active_event_c2[2]
-                        y_label[frame_ind, 5, active_event_c2[0]] = active_event_c2[3]
-                        dist_label[frame_ind, 5, active_event_c2[0]] = active_event_c2[4] / 100.
-                        onscreen_label[frame_ind, 5, active_event_c2[0]] = active_event_c2[5]
-                    active_event_list_per_class = []
-
-    label_mat = torch.stack((se_label, x_label, y_label, dist_label, onscreen_label), dim=2)  # [nb_frames, 6, 5(act+XY+dist+onscreen), max_classes]
-    return label_mat
+def convert_cartesian_to_polar(data):
+    out = {}
+    for frame, events in data.items():
+        out[frame] = []
+        for e in events:
+            az = np.arctan2(e[3], e[2]) * 180 / np.pi
+            out[frame].append(e[:2] + [az] + e[4:])
+    return out
 
 
-def organize_labels(input_dict, max_frames, max_tracks=10):
-    """
-    :param input_dict: Dictionary containing frame-wise sound event time and location information
-            _pred_dict[frame-index] = [[class-index, source-index, azimuth, distance, onscreen] x events in frame]
-    :param max_frames: Total number of frames in the recording
-    :param max_tracks: Total number of tracks in the output dict
-    :return: Dictionary containing class-wise sound event location information in each frame
-            dictionary_name[frame-index][class-index][track-index] = [azimuth, distance, onscreen]
-    """
-    tracks = set(range(max_tracks))
-    output_dict = {x: {} for x in range(max_frames)}
-    for frame_idx in range(0, max_frames):
-        if frame_idx not in input_dict:
+def _fill_adpit_slot(se, x_l, y_l, dist_l, on_l, frame, slot, ev):
+    cls = ev[0]
+    se[frame, slot, cls]    = 1
+    x_l[frame, slot, cls]   = ev[2]
+    y_l[frame, slot, cls]   = ev[3]
+    dist_l[frame, slot, cls] = ev[4] / 100.0
+    on_l[frame, slot, cls]  = ev[5]
+
+
+def process_labels_adpit(label_data, nb_frames, nb_classes):
+    se   = torch.zeros(nb_frames, 6, nb_classes)
+    x_l  = torch.zeros(nb_frames, 6, nb_classes)
+    y_l  = torch.zeros(nb_frames, 6, nb_classes)
+    d_l  = torch.zeros(nb_frames, 6, nb_classes)
+    on_l = torch.zeros(nb_frames, 6, nb_classes)
+
+    for frame, events in label_data.items():
+        if frame >= nb_frames:
             continue
-        for [class_idx, source_idx, az, dist, onscreen] in input_dict[frame_idx]:
-            if class_idx not in output_dict[frame_idx]:
-                output_dict[frame_idx][class_idx] = {}
-            if source_idx not in output_dict[frame_idx][class_idx] and source_idx < max_tracks:
-                track_idx = source_idx  # If possible, use source_idx as track_idx
-            else:                       # If not, use the first one available
-                try:
-                    track_idx = list(set(tracks) - output_dict[frame_idx][class_idx].keys())[0]
-                except IndexError:
-                    warnings.warn("The number of sources of is higher than the number of tracks. "
-                                  "Some events will be missed.")
-                    track_idx = 0  # Overwrite one event
-            output_dict[frame_idx][class_idx][track_idx] = [az, dist, onscreen]
+        events = sorted(events, key=lambda e: e[0])
+        group = []
+        for i, ev in enumerate(events):
+            group.append(ev)
+            at_end     = (i == len(events) - 1)
+            class_done = at_end or (ev[0] != events[i + 1][0])
+            if class_done:
+                n = len(group)
+                if n == 1:
+                    _fill_adpit_slot(se, x_l, y_l, d_l, on_l, frame, 0, group[0])
+                elif n == 2:
+                    _fill_adpit_slot(se, x_l, y_l, d_l, on_l, frame, 1, group[0])
+                    _fill_adpit_slot(se, x_l, y_l, d_l, on_l, frame, 2, group[1])
+                else:
+                    _fill_adpit_slot(se, x_l, y_l, d_l, on_l, frame, 3, group[0])
+                    _fill_adpit_slot(se, x_l, y_l, d_l, on_l, frame, 4, group[1])
+                    _fill_adpit_slot(se, x_l, y_l, d_l, on_l, frame, 5, group[2])
+                group = []
 
-    return output_dict
-
-
-def convert_polar_to_cartesian(input_dict):
-    output_dict = {}
-    for frame_idx in input_dict.keys():
-        if frame_idx not in output_dict:
-            output_dict[frame_idx] = []
-        for tmp_val in input_dict[frame_idx]:
-            azi_rad = tmp_val[2]*np.pi/180
-            x = np.cos(azi_rad)
-            y = np.sin(azi_rad)
-            output_dict[frame_idx].append(tmp_val[0:2] + [x, y] + tmp_val[3:])
-    return output_dict
+    return torch.stack((se, x_l, y_l, d_l, on_l), dim=2)
 
 
-def convert_cartesian_to_polar(input_dict):
-    output_dict = {}
-    for frame_idx in input_dict.keys():
-        if frame_idx not in output_dict:
-            output_dict[frame_idx] = []
-        for tmp_val in input_dict[frame_idx]:
-            x = tmp_val[2]
-            y = tmp_val[3]
-            azi_rad = np.arctan2(y, x)
-            azimuth = azi_rad * 180 / np.pi
-            output_dict[frame_idx].append(tmp_val[0:2] + [azimuth] + tmp_val[4:])
-    return output_dict
+def organize_labels(data, max_frames, max_tracks=10):
+    out    = {f: {} for f in range(max_frames)}
+    tracks = set(range(max_tracks))
+    for frame in range(max_frames):
+        if frame not in data:
+            continue
+        for cls, src, az, dist, on in data[frame]:
+            out[frame].setdefault(cls, {})
+            if src not in out[frame][cls] and src < max_tracks:
+                tid = src
+            else:
+                free = list(tracks - set(out[frame][cls].keys()))
+                if not free:
+                    warnings.warn("More sources than tracks; dropping event.")
+                    tid = 0
+                else:
+                    tid = free[0]
+            out[frame][cls][tid] = [az, dist, on]
+    return out
 
 
-def get_accdoa_labels(logits, nb_classes, modality):
-    x, y = logits[:, :, :nb_classes], logits[:, :, nb_classes:2 * nb_classes]
-    sed = torch.sqrt(x ** 2 + y ** 2) > 0.5
-    distance = logits[:, :, 2 * nb_classes: 3 * nb_classes]
-    distance[distance < 0.] = 0.
-    if modality == 'audio_visual':
-        on_screen = logits[:, :, 3 * nb_classes: 4 * nb_classes]
-    else:
-        on_screen = torch.zeros_like(distance)  # don't care for audio modality
-    dummy_src_id = torch.zeros_like(distance)
-    return sed, dummy_src_id, x, y, distance, on_screen
+# --------------------------------------------------------------------------- #
+# Prediction decoding and output writing
+# --------------------------------------------------------------------------- #
+
+def _decode_multiaccdoa(logits, nb_cls):
+    # logits: (B, T, 117) = 3 tracks × (x, y, dist) × 13 classes
+    results = []
+    for t in range(3):
+        b = t * 3 * nb_cls
+        x   = logits[:, :, b          : b +   nb_cls]
+        y   = logits[:, :, b + nb_cls  : b + 2*nb_cls]
+        d   = logits[:, :, b + 2*nb_cls: b + 3*nb_cls].clamp(min=0)
+        sed = (x**2 + y**2).sqrt() > 0.5
+        doa = logits[:, :, b: b + 2*nb_cls]
+        src = torch.zeros_like(d)
+        on  = torch.zeros_like(d)
+        results.append((sed, src, doa, d, on))
+    return results
 
 
-def get_multiaccdoa_labels(logits, nb_classes, modality):
-    if modality == 'audio':
-        x0, y0 = logits[:, :, :1*nb_classes], logits[:, :, 1*nb_classes:2*nb_classes]
-        sed0 = torch.sqrt(x0**2 + y0**2) > 0.5
-        dist0 = logits[:, :, 2*nb_classes:3*nb_classes]
-        dist0[dist0 < 0.] = 0
-        doa0 = logits[:, :, :2*nb_classes]
-        dummy_src_id0 = torch.zeros_like(dist0)
-        on_screen0 = torch.zeros_like(dist0)
-
-        x1, y1 = logits[:, :, 3*nb_classes:4 * nb_classes], logits[:, :, 4 * nb_classes: 5 * nb_classes]
-        sed1 = torch.sqrt(x1 ** 2 + y1 ** 2) > 0.5
-        dist1 = logits[:, :, 5 * nb_classes:6 * nb_classes]
-        dist1[dist1 < 0.] = 0
-        doa1 = logits[:, :, 3*nb_classes:5 * nb_classes]
-        dummy_src_id1 = torch.zeros_like(dist1)
-        on_screen1 = torch.zeros_like(dist1)
-
-        x2, y2 = logits[:, :, 6*nb_classes:7 * nb_classes], logits[:, :, 7 * nb_classes:8 * nb_classes]
-        sed2 = torch.sqrt(x2 ** 2 + y2 ** 2) > 0.5
-        dist2 = logits[:, :, 8 * nb_classes:9 * nb_classes]
-        dist2[dist2 < 0.] = 0
-        doa2 = logits[:, :, 6*nb_classes:8 * nb_classes]
-        dummy_src_id2 = torch.zeros_like(dist2)
-        on_screen2 = torch.zeros_like(dist2)
-
-        return sed0, dummy_src_id0, doa0,  dist0, on_screen0, sed1, dummy_src_id1, doa1,  dist1, on_screen1, sed2, dummy_src_id2, doa2,  dist2, on_screen2
-
-    else:
-        x0, y0 = logits[:, :, :1 * nb_classes], logits[:, :, 1 * nb_classes:2 * nb_classes]
-        sed0 = torch.sqrt(x0 ** 2 + y0 ** 2) > 0.5
-        dist0 = logits[:, :, 2 * nb_classes:3 * nb_classes]
-        dist0[dist0 < 0.] = 0
-        doa0 = logits[:, :, :2 * nb_classes]
-        dummy_src_id0 = torch.zeros_like(dist0)
-        on_screen0 = logits[:, :, 3 * nb_classes:4 * nb_classes]
-
-        x1, y1 = logits[:, :, 4 * nb_classes:5 * nb_classes], logits[:, :, 5 * nb_classes: 6 * nb_classes]
-        sed1 = torch.sqrt(x1 ** 2 + y1 ** 2) > 0.5
-        dist1 = logits[:, :, 6 * nb_classes:7 * nb_classes]
-        dist1[dist1 < 0.] = 0
-        doa1 = logits[:, :, 4 * nb_classes:6 * nb_classes]
-        dummy_src_id1 = torch.zeros_like(dist1)
-        on_screen1 = logits[:, :, 7 * nb_classes:8 * nb_classes]
-
-        x2, y2 = logits[:, :, 8 * nb_classes:9 * nb_classes], logits[:, :, 9 * nb_classes:10 * nb_classes]
-        sed2 = torch.sqrt(x2 ** 2 + y2 ** 2) > 0.5
-        dist2 = logits[:, :, 10 * nb_classes:11 * nb_classes]
-        dist2[dist2 < 0.] = 0
-        doa2 = logits[:, :, 8 * nb_classes:10 * nb_classes]
-        dummy_src_id2 = torch.zeros_like(dist2)
-        on_screen2 = logits[:, :, 11 * nb_classes:12 * nb_classes]
-
-        return sed0, dummy_src_id0, doa0, dist0, on_screen0, sed1, dummy_src_id1, doa1, dist1, on_screen1, sed2, dummy_src_id2, doa2, dist2, on_screen2
+def _similar_location(sed0, sed1, doa0, doa1, cls, thresh, nb_cls):
+    if sed0 == 1 and sed1 == 1:
+        x1, y1 = doa0[cls], doa0[cls + nb_cls]
+        x2, y2 = doa1[cls], doa1[cls + nb_cls]
+        n1 = np.sqrt(x1**2 + y1**2 + 1e-10)
+        n2 = np.sqrt(x2**2 + y2**2 + 1e-10)
+        dot = np.clip(x1/n1*x2/n2 + y1/n1*y2/n2, -1, 1)
+        return int(np.arccos(dot) * 180 / np.pi < thresh)
+    return 0
 
 
-def get_output_dict_format_single_accdoa(sed, src_id, x, y, dist, onscreen, convert_to_polar=True):
-    output_dict = {}
-    for frame_cnt in range(sed.shape[0]):
-        for class_cnt in range(sed.shape[1]):
-            if sed[frame_cnt][class_cnt] > 0.5:
-                if frame_cnt not in output_dict:
-                    output_dict[frame_cnt] = []
-                output_dict[frame_cnt].append([class_cnt, src_id[frame_cnt][class_cnt], x[frame_cnt][class_cnt], y[frame_cnt][class_cnt], dist[frame_cnt][class_cnt], onscreen[frame_cnt][class_cnt]])
+def _build_output_dict(sed0, sid0, doa0, dist0, os0,
+                       sed1, sid1, doa1, dist1, os1,
+                       sed2, sid2, doa2, dist2, os2,
+                       thresh, nb_cls):
+    out = {}
+    for f in range(sed0.shape[0]):
+        for c in range(sed0.shape[1]):
+            s01 = _similar_location(sed0[f][c], sed1[f][c], doa0[f], doa1[f], c, thresh, nb_cls)
+            s12 = _similar_location(sed1[f][c], sed2[f][c], doa1[f], doa2[f], c, thresh, nb_cls)
+            s20 = _similar_location(sed2[f][c], sed0[f][c], doa2[f], doa0[f], c, thresh, nb_cls)
+            total = s01 + s12 + s20
+            out.setdefault(f, [])
 
-    if convert_to_polar:
-        output_dict = convert_cartesian_to_polar(output_dict)
-    return output_dict
+            def _add(sed, sid, doa, dist, on):
+                if sed[f][c] > 0.5:
+                    out[f].append([c, sid[f][c], doa[f][c], doa[f][c + nb_cls], dist[f][c], on[f][c]])
 
+            def _add_avg(doa_a, doa_b, dist_a, dist_b, sid, on):
+                avg_doa  = (doa_a[f] + doa_b[f]) / 2
+                avg_dist = (dist_a[f] + dist_b[f]) / 2
+                out[f].append([c, sid[f][c], avg_doa[c], avg_doa[c + nb_cls], avg_dist[c], on[f][c]])
 
-def distance_between_cartesian_coordinates(x1, y1, x2, y2):
-    """
-    Angular distance between two cartesian coordinates
-    MORE: https://en.wikipedia.org/wiki/Great-circle_distance
-    Check 'From chord length' section
+            if total == 0:
+                _add(sed0, sid0, doa0, dist0, os0)
+                _add(sed1, sid1, doa1, dist1, os1)
+                _add(sed2, sid2, doa2, dist2, os2)
+            elif total == 1:
+                if s01:
+                    _add(sed2, sid2, doa2, dist2, os2)
+                    _add_avg(doa0, doa1, dist0, dist1, sid0, os0)
+                elif s12:
+                    _add(sed0, sid0, doa0, dist0, os0)
+                    _add_avg(doa1, doa2, dist1, dist2, sid1, os1)
+                else:
+                    _add(sed1, sid1, doa1, dist1, os1)
+                    _add_avg(doa2, doa0, dist2, dist0, sid2, os2)
+            else:
+                avg_doa  = (doa0[f] + doa1[f] + doa2[f]) / 3
+                avg_dist = (dist0[f] + dist1[f] + dist2[f]) / 3
+                out[f].append([c, sid0[f][c], avg_doa[c], avg_doa[c + nb_cls], avg_dist[c], os0[f][c]])
 
-    :return: angular distance in degrees
-    """
-    # Normalize the Cartesian vectors
-    N1 = np.sqrt(x1**2 + y1**2 + 1e-10)
-    N2 = np.sqrt(x2**2 + y2**2 + 1e-10)
-    x1, y1, x2, y2 = x1/N1, y1/N1, x2/N2, y2/N2
-
-    # Compute the distance
-    dist = x1*x2 + y1*y2
-    dist = np.clip(dist, -1, 1)
-    dist = np.arccos(dist) * 180 / np.pi
-    return dist
-
-
-def fold_az_angle(az):
-    """
-    Project azimuth angle into the range [-90, 90]
-
-    :param az: azimuth angle in degrees
-    :return: folded angle in degrees
-    """
-    # Fold az angles
-    az = (az + 180) % 360 - 180  # Make sure az is in the range [-180, 180)
-    az_fold = az.copy()
-    az_fold[np.logical_and(-180 <= az, az < -90)] = -180 - az[np.logical_and(-180 <= az, az < -90)]
-    az_fold[np.logical_and(90 < az, az <= 180)] = 180 - az[np.logical_and(90 < az, az <= 180)]
-    return az_fold
+    return convert_cartesian_to_polar(out)
 
 
-def determine_similar_location(sed_pred0, sed_pred1, doa_pred0, doa_pred1, class_cnt, thresh_unify, nb_classes):
-    if (sed_pred0 == 1) and (sed_pred1 == 1):
-        if distance_between_cartesian_coordinates(doa_pred0[class_cnt], doa_pred0[class_cnt+1*nb_classes], doa_pred1[class_cnt], doa_pred1[class_cnt+1*nb_classes]) < thresh_unify:
-            return 1
-        else:
-            return 0
-    else:
-        return 0
-
-
-def get_output_dict_format_multi_accdoa(sed0, dummy_src_id0, doa0, dist0, on_screen0, sed1, dummy_src_id1, doa1, dist1, on_screen1, sed2, dummy_src_id2, doa2, dist2, on_screen2, thresh_unify, nb_classes, convert_to_polar=True):
-    output_dict = {}
-    for frame_cnt in range(sed0.shape[0]):
-        for class_cnt in range(sed0.shape[1]):
-            flag_0sim1 = determine_similar_location(sed0[frame_cnt][class_cnt], sed1[frame_cnt][class_cnt], doa0[frame_cnt], doa1[frame_cnt], class_cnt, thresh_unify, nb_classes)
-            flag_1sim2 = determine_similar_location(sed1[frame_cnt][class_cnt], sed2[frame_cnt][class_cnt], doa1[frame_cnt], doa2[frame_cnt], class_cnt, thresh_unify, nb_classes)
-            flag_2sim0 = determine_similar_location(sed2[frame_cnt][class_cnt], sed0[frame_cnt][class_cnt], doa2[frame_cnt], doa0[frame_cnt], class_cnt, thresh_unify, nb_classes)
-
-            # unify or not unify according to flag
-            if flag_0sim1 + flag_1sim2 + flag_2sim0 == 0:
-                if sed0[frame_cnt][class_cnt] > 0.5:
-                    if frame_cnt not in output_dict:
-                        output_dict[frame_cnt] = []
-                    output_dict[frame_cnt].append([class_cnt,
-                                                   dummy_src_id0[frame_cnt][class_cnt],
-                                                   doa0[frame_cnt][class_cnt],
-                                                   doa0[frame_cnt][class_cnt + nb_classes],
-                                                   dist0[frame_cnt][class_cnt],
-                                                   on_screen0[frame_cnt][class_cnt]])
-
-                if sed1[frame_cnt][class_cnt] > 0.5:
-                    if frame_cnt not in output_dict:
-                        output_dict[frame_cnt] = []
-                    output_dict[frame_cnt].append([class_cnt,
-                                                   dummy_src_id1[frame_cnt][class_cnt],
-                                                   doa1[frame_cnt][class_cnt],
-                                                   doa1[frame_cnt][class_cnt + nb_classes],
-                                                   dist1[frame_cnt][class_cnt],
-                                                   on_screen1[frame_cnt][class_cnt]])
-
-                if sed2[frame_cnt][class_cnt] > 0.5:
-                    if frame_cnt not in output_dict:
-                        output_dict[frame_cnt] = []
-                    output_dict[frame_cnt].append([class_cnt,
-                                                   dummy_src_id2[frame_cnt][class_cnt],
-                                                   doa2[frame_cnt][class_cnt],
-                                                   doa2[frame_cnt][class_cnt + nb_classes],
-                                                   dist2[frame_cnt][class_cnt],
-                                                   on_screen2[frame_cnt][class_cnt]])
-
-            elif flag_0sim1 + flag_1sim2 + flag_2sim0 == 1:
-                if frame_cnt not in output_dict:
-                    output_dict[frame_cnt] = []
-                if flag_0sim1:
-                    if sed2[frame_cnt][class_cnt] > 0.5:
-                        output_dict[frame_cnt].append([class_cnt,
-                                                       dummy_src_id2[frame_cnt][class_cnt],
-                                                       doa2[frame_cnt][class_cnt],
-                                                       doa2[frame_cnt][class_cnt + nb_classes],
-                                                       dist2[frame_cnt][class_cnt],
-                                                       on_screen2[frame_cnt][class_cnt]])
-
-                    doa_pred_fc = (doa0[frame_cnt] + doa1[frame_cnt]) / 2
-                    dist_pred_fc = (dist0[frame_cnt] + dist1[frame_cnt]) / 2
-                    on_screen_pred_fc = on_screen0[frame_cnt]  # TODO: How to choose
-                    dummy_src_id_pred_fc = dummy_src_id0[frame_cnt]
-                    output_dict[frame_cnt].append(
-                        [class_cnt, dummy_src_id_pred_fc[class_cnt], doa_pred_fc[class_cnt], doa_pred_fc[class_cnt + nb_classes],dist_pred_fc[class_cnt], on_screen_pred_fc[class_cnt]])
-
-                elif flag_1sim2:
-                    if sed0[frame_cnt][class_cnt] > 0.5:
-                        output_dict[frame_cnt].append([class_cnt,
-                                                       dummy_src_id0[frame_cnt][class_cnt],
-                                                       doa0[frame_cnt][class_cnt],
-                                                       doa0[frame_cnt][class_cnt + nb_classes],
-                                                       dist0[frame_cnt][class_cnt],
-                                                       on_screen0[frame_cnt][class_cnt]])
-
-                    doa_pred_fc = (doa1[frame_cnt] + doa2[frame_cnt]) / 2
-                    dist_pred_fc = (dist1[frame_cnt] + dist2[frame_cnt]) / 2
-                    on_screen_pred_fc = on_screen1[frame_cnt]  # TODO: How to choose
-                    dummy_src_id_pred_fc = dummy_src_id1[frame_cnt]
-
-                    output_dict[frame_cnt].append(
-                        [class_cnt, dummy_src_id_pred_fc[class_cnt], doa_pred_fc[class_cnt],
-                         doa_pred_fc[class_cnt + nb_classes], dist_pred_fc[class_cnt], on_screen_pred_fc[class_cnt]])
-
-                elif flag_2sim0:
-                    if sed1[frame_cnt][class_cnt] > 0.5:
-                        output_dict[frame_cnt].append([class_cnt,
-                                                       dummy_src_id1[frame_cnt][class_cnt],
-                                                       doa1[frame_cnt][class_cnt],
-                                                       doa1[frame_cnt][class_cnt + nb_classes],
-                                                       dist1[frame_cnt][class_cnt],
-                                                       on_screen1[frame_cnt][class_cnt]])
-
-                    doa_pred_fc = (doa2[frame_cnt] + doa0[frame_cnt]) / 2
-                    dist_pred_fc = (dist2[frame_cnt] + dist0[frame_cnt]) / 2
-                    on_screen_pred_fc = on_screen2[frame_cnt]  # TODO: How to choose
-                    dummy_src_id_pred_fc = dummy_src_id2[frame_cnt]
-
-                    output_dict[frame_cnt].append(
-                        [class_cnt, dummy_src_id_pred_fc[class_cnt], doa_pred_fc[class_cnt],
-                         doa_pred_fc[class_cnt + nb_classes], dist_pred_fc[class_cnt], on_screen_pred_fc[class_cnt]])
-
-            elif flag_0sim1 + flag_1sim2 + flag_2sim0 >= 2:
-                if frame_cnt not in output_dict:
-                    output_dict[frame_cnt] = []
-                doa_pred_fc = (doa0[frame_cnt] + doa1[frame_cnt] + doa2[frame_cnt]) / 3
-                dist_pred_fc = (dist0[frame_cnt] + dist1[frame_cnt] + dist2[frame_cnt]) / 3
-
-                dummy_src_id_pred_fc = dummy_src_id0[frame_cnt]
-                on_screen_pred_fc = on_screen0[frame_cnt]  # TODO: How to do this?
-
-                output_dict[frame_cnt].append(
-                    [class_cnt, dummy_src_id_pred_fc[class_cnt], doa_pred_fc[class_cnt], doa_pred_fc[class_cnt + nb_classes], dist_pred_fc[class_cnt], on_screen_pred_fc[class_cnt]])
-
-    if convert_to_polar:
-        output_dict = convert_cartesian_to_polar(output_dict)
-    return output_dict
-
-
-def write_to_dcase_output_format(output_dict, output_dir, filename, split, convert_dist_to_cm=True):
+def _write_csv(output_dict, output_dir, filename, split):
     os.makedirs(os.path.join(output_dir, split), exist_ok=True)
-    file_path = os.path.join(output_dir,split, filename)
-    with open(file_path, 'w') as f:
+    with open(os.path.join(output_dir, split, filename), 'w') as f:
         f.write('frame,class,source,azimuth,distance,onscreen\n')
-        # Write data
-        for frame_ind, values in output_dict.items():
-            for value in values:
-                azimuth_rounded = round(float(value[2]))
-                dist_rounded = round(float(value[3]) * 100) if convert_dist_to_cm else round(float(value[3]))
-                f.write(f"{int(frame_ind)},{int(value[0])},{int(value[1])},{azimuth_rounded},{dist_rounded},{int(value[4])}\n")
+        for frame, events in output_dict.items():
+            for v in events:
+                f.write(f"{int(frame)},{int(v[0])},{int(v[1])},"
+                        f"{round(float(v[2]))},{round(float(v[3])*100)},{int(v[4])}\n")
 
 
 def write_logits_to_dcase_format(logits, params, output_dir, filelist, split='dev-test'):
-    if not params['multiACCDOA']:
-        sed, dummy_src_id, x, y, dist, onscreen = get_accdoa_labels(logits, params['nb_classes'], params['modality'])
-        for i in range(sed.size(0)):
-            sed_i, dummy_src_id_i, x_i, y_i, dist_i, onscreen_i = sed[i].cpu().numpy(), dummy_src_id[i].cpu().numpy(), x[i].cpu().numpy(), y[i].cpu().numpy(), dist[i].cpu().numpy(), onscreen[i].cpu().numpy()
-            output_dict = get_output_dict_format_single_accdoa(sed_i, dummy_src_id_i, x_i, y_i, dist_i, onscreen_i, convert_to_polar=True)
-            write_to_dcase_output_format(output_dict, output_dir, os.path.basename(filelist[i])[:-3] + '.csv', split)
+    nb_cls = params['nb_classes']
+    tracks = _decode_multiaccdoa(logits, nb_cls)
+    for i in range(logits.shape[0]):
+        t = [tuple(x[i].cpu().numpy() for x in trk) for trk in tracks]
+        out = _build_output_dict(
+            *t[0], *t[1], *t[2],
+            params['thresh_unify'], nb_cls
+        )
+        _write_csv(out, output_dir, os.path.basename(filelist[i])[:-3] + '.csv', split)
 
-    else:
-        (sed0, dummy_src_id0, doa0, dist0, on_screen0,
-         sed1, dummy_src_id1, doa1, dist1, on_screen1,
-         sed2, dummy_src_id2, doa2, dist2, on_screen2) = get_multiaccdoa_labels(logits, params['nb_classes'], params['modality'])
 
-        for i in range(sed0.size(0)):
-            sed0_i, dummy_src_id0_i, doa0_i, dist0_i, on_screen0_i = sed0[i].cpu().numpy(), dummy_src_id0[i].cpu().numpy(), doa0[i].cpu().numpy(), dist0[i].cpu().numpy(), on_screen0[i].cpu().numpy()
-            sed1_i, dummy_src_id1_i, doa1_i, dist1_i, on_screen1_i = sed1[i].cpu().numpy(), dummy_src_id1[i].cpu().numpy(), doa1[i].cpu().numpy(), dist1[i].cpu().numpy(), on_screen1[i].cpu().numpy()
-            sed2_i, dummy_src_id2_i, doa2_i, dist2_i, on_screen2_i = sed2[i].cpu().numpy(), dummy_src_id2[i].cpu().numpy(), doa2[i].cpu().numpy(), dist2[i].cpu().numpy(), on_screen2[i].cpu().numpy()
+# --------------------------------------------------------------------------- #
+# Metrics helpers
+# --------------------------------------------------------------------------- #
 
-            output_dict = get_output_dict_format_multi_accdoa(sed0_i, dummy_src_id0_i, doa0_i, dist0_i, on_screen0_i,
-                                                              sed1_i, dummy_src_id1_i, doa1_i, dist1_i, on_screen1_i,
-                                                              sed2_i, dummy_src_id2_i, doa2_i, dist2_i, on_screen2_i, params['thresh_unify'], params['nb_classes'], convert_to_polar=True)
-            write_to_dcase_output_format(output_dict, output_dir, os.path.basename(filelist[i])[:-3] + '.csv', split)
+def fold_az_angle(az):
+    az = (az + 180) % 360 - 180
+    folded = az.copy()
+    folded[az < -90] = -180 - az[az < -90]
+    folded[az >  90] =  180 - az[az >  90]
+    return folded
+
+
+def least_distance_between_gt_pred(gt_az, pred_az):
+    gt_len, pred_len = len(gt_az), len(pred_az)
+    cost = np.zeros((gt_len, pred_len))
+    if gt_len and pred_len:
+        pairs = np.array([[g, p] for p in range(pred_len) for g in range(gt_len)])
+        cost[pairs[:, 0], pairs[:, 1]] = np.abs(
+            fold_az_angle(gt_az[pairs[:, 0]]) - fold_az_angle(pred_az[pairs[:, 1]])
+        )
+    rows, cols = linear_sum_assignment(cost)
+    return cost[rows, cols], rows, cols
 
 
 def jackknife_estimation(global_value, partial_estimates, significance_level=0.05):
-    """
-    Compute jackknife statistics from a global value and partial estimates.
-    Original function by Nicolas Turpault
-
-    :param global_value: Value calculated using all (N) examples
-    :param partial_estimates: Partial estimates using N-1 examples at a time
-    :param significance_level: Significance value used for t-test
-
-    :return:
-    estimate: estimated value using partial estimates
-    bias: Bias computed between global value and the partial estimates
-    std_err: Standard deviation of partial estimates
-    conf_interval: Confidence interval obtained after t-test
-    """
-
-    mean_jack_stat = np.mean(partial_estimates)
-    n = len(partial_estimates)
-    bias = (n - 1) * (mean_jack_stat - global_value)
-
-    std_err = np.sqrt(
-        (n - 1) * np.mean((partial_estimates - mean_jack_stat) * (partial_estimates - mean_jack_stat), axis=0)
-    )
-
-    # bias-corrected "jackknifed estimate"
+    n    = len(partial_estimates)
+    mean = np.mean(partial_estimates)
+    bias = (n - 1) * (mean - global_value)
+    std_err = np.sqrt((n - 1) * np.mean((partial_estimates - mean)**2))
     estimate = global_value - bias
-
-    # jackknife confidence interval
-    if not (0 < significance_level < 1):
-        raise ValueError("confidence level must be in (0, 1).")
-
-    t_value = stats.t.ppf(1 - significance_level / 2, n - 1)
-
-    # t-test
-    conf_interval = estimate + t_value * np.array((-std_err, std_err))
-
-    return estimate, bias, std_err, conf_interval
+    t = stats.t.ppf(1 - significance_level / 2, n - 1)
+    return estimate, bias, std_err, estimate + t * np.array([-std_err, std_err])
 
 
-def least_distance_between_gt_pred(gt_list, pred_list):
-    """
-        Shortest distance between two sets of azimuth angles. Given a set of ground truth coordinates,
-        and its respective predicted coordinates, we calculate the distance between each of the
-        coordinate pairs resulting in a matrix of distances, where one axis represents the number of ground truth
-        coordinates and the other the predicted coordinates. The number of estimated peaks need not be the same as in
-        ground truth, thus the distance matrix is not always a square matrix. We use the hungarian algorithm to find the
-        least cost in this distance matrix.
-        :param gt_list: list of ground-truth azimuth angles in degrees
-        :param pred_list: list of predicted azimuth angles in degrees
-        :return: cost - azimuth distance (after folding them to the range [-90, 90])
-        :return: row_ind - row indexes obtained from the Hungarian algorithm
-        :return: col_ind - column indexes obtained from the Hungarian algorithm
-    """
-    gt_len, pred_len = gt_list.shape[0], pred_list.shape[0]
-    ind_pairs = np.array([[x, y] for y in range(pred_len) for x in range(gt_len)])
-    cost_mat = np.zeros((gt_len, pred_len))
+# --------------------------------------------------------------------------- #
+# Results printing
+# --------------------------------------------------------------------------- #
 
-    if gt_len and pred_len:
-        az1, az2 = gt_list[ind_pairs[:, 0]], pred_list[ind_pairs[:, 1]]
-        distances_ang = np.abs(fold_az_angle(az1) - fold_az_angle(az2))
-        cost_mat[ind_pairs[:, 0], ind_pairs[:, 1]] = distances_ang
+def print_results(f, ang, dist, rel_dist, onscreen, class_wise, params):
+    jk = params['use_jackknife']
+    def fmt(v, ci): return f"{v[0]:.2f} [{ci[0]:.2f}, {ci[1]:.2f}]" if jk else f"{v:.2f}"
 
-    row_ind, col_ind = linear_sum_assignment(cost_mat)
-    cost = cost_mat[row_ind, col_ind]
-    return cost, row_ind, col_ind
+    print(f"\nF-score:              {fmt(f,        f[1]        if jk else 0) if jk else f'{100*f:.1f}%'}")
+    print(f"DOA error:            {fmt(ang,      ang[1]      if jk else 0) if jk else f'{ang:.1f}°'}")
+    print(f"Distance error:       {fmt(dist,     dist[1]     if jk else 0) if jk else f'{dist:.2f} cm'}")
+    print(f"Rel distance error:   {fmt(rel_dist, rel_dist[1] if jk else 0) if jk else f'{rel_dist:.2f}'}")
 
-
-def print_results(f, ang_error, dist_error, rel_dist_error, onscreen_acc, class_wise_scr, params):
-    use_jackknife = params['use_jackknife']
-    print('\n\n')
-    print('F-score: {:0.1f}% {}'.format(
-        100 * f[0] if use_jackknife else 100 * f,
-        '[{:0.2f}, {:0.2f}]'.format(100 * f[1][0], 100 * f[1][1]) if use_jackknife else ''
-    ))
-
-    print('DOA error: {:0.1f} {}'.format(
-        ang_error[0] if use_jackknife else ang_error,
-        '[{:0.2f}, {:0.2f}]'.format(ang_error[1][0], ang_error[1][1]) if use_jackknife else ''
-    ))
-
-    print('Distance error: {:0.2f} {}'.format(
-        dist_error[0] if use_jackknife else dist_error,
-        '[{:0.2f}, {:0.2f}]'.format(dist_error[1][0], dist_error[1][1]) if use_jackknife else ''
-    ))
-    print('Relative distance error: {:0.2f} {}'.format(
-        rel_dist_error[0] if use_jackknife else rel_dist_error,
-        '[{:0.2f}, {:0.2f}]'.format(rel_dist_error[1][0], rel_dist_error[1][1]) if use_jackknife else ''
-    ))
-
-    if params['modality'] == 'audio_visual':
-        print('Onscreen accuracy: {:0.1f}% {}'.format(
-            100 * onscreen_acc[0] if use_jackknife else 100 * onscreen_acc,
-            '[{:0.2f}, {:0.2f}]'.format(100 * onscreen_acc[1][0],
-                                        100 * onscreen_acc[1][1]) if use_jackknife else ''
-        ))
-
-    if params['average'] == 'macro':
-        print('Class-wise results on unseen data:')
-
-        if params['modality'] == 'audio_visual':
-            print('Class\tF-score\tDOA-Error\tDist-Error\tRelDist-Error\tOnscreenAcc.')
-        else:
-            print('Class\tF-score\tDOA-Error\tDist-Error\tRelDist-Error')
-
-        for cls_cnt in range(params['nb_classes']):
-            if params['modality'] == 'audio_visual':
-                print('{}\t{:0.2f} {}\t{:0.2f} {}\t{:0.2f} {}\t{:0.2f} {}\t{:0.2f} {}'.format(
-                    cls_cnt,
-                    class_wise_scr[0][0][cls_cnt] if use_jackknife else class_wise_scr[0][cls_cnt],
-                    '[{:0.2f}, {:0.2f}]'.format(class_wise_scr[1][0][cls_cnt][0],
-                                                class_wise_scr[1][0][cls_cnt][1]) if use_jackknife else '',
-                    class_wise_scr[0][1][cls_cnt] if use_jackknife else class_wise_scr[1][cls_cnt],
-                    '[{:0.2f}, {:0.2f}]'.format(class_wise_scr[1][1][cls_cnt][0],
-                                                class_wise_scr[1][1][cls_cnt][1]) if use_jackknife else '',
-                    class_wise_scr[0][2][cls_cnt] if use_jackknife else class_wise_scr[2][cls_cnt],
-                    '[{:0.2f}, {:0.2f}]'.format(class_wise_scr[1][2][cls_cnt][0],
-                                                class_wise_scr[1][2][cls_cnt][1]) if use_jackknife else '',
-                    class_wise_scr[0][3][cls_cnt] if use_jackknife else class_wise_scr[3][cls_cnt],
-                    '[{:0.2f}, {:0.2f}]'.format(class_wise_scr[1][3][cls_cnt][0],
-                                                class_wise_scr[1][3][cls_cnt][1]) if use_jackknife else '',
-                    class_wise_scr[0][4][cls_cnt] if use_jackknife else class_wise_scr[4][cls_cnt],
-                    '[{:0.2f}, {:0.2f}]'.format(class_wise_scr[1][4][cls_cnt][0],
-                                                class_wise_scr[1][4][cls_cnt][1]) if use_jackknife else ''
-                ))
-            else:
-                print('{}\t{:0.2f} {}\t{:0.2f} {}\t{:0.2f} {}\t{:0.2f} {}'.format(
-                    cls_cnt,
-                    class_wise_scr[0][0][cls_cnt] if use_jackknife else class_wise_scr[0][cls_cnt],
-                    '[{:0.2f}, {:0.2f}]'.format(class_wise_scr[1][0][cls_cnt][0],
-                                                class_wise_scr[1][0][cls_cnt][1]) if use_jackknife else '',
-                    class_wise_scr[0][1][cls_cnt] if use_jackknife else class_wise_scr[1][cls_cnt],
-                    '[{:0.2f}, {:0.2f}]'.format(class_wise_scr[1][1][cls_cnt][0],
-                                                class_wise_scr[1][1][cls_cnt][1]) if use_jackknife else '',
-                    class_wise_scr[0][2][cls_cnt] if use_jackknife else class_wise_scr[2][cls_cnt],
-                    '[{:0.2f}, {:0.2f}]'.format(class_wise_scr[1][2][cls_cnt][0],
-                                                class_wise_scr[1][2][cls_cnt][1]) if use_jackknife else '',
-                    class_wise_scr[0][3][cls_cnt] if use_jackknife else class_wise_scr[3][cls_cnt],
-                    '[{:0.2f}, {:0.2f}]'.format(class_wise_scr[1][3][cls_cnt][0],
-                                                class_wise_scr[1][3][cls_cnt][1]) if use_jackknife else ''
-                ))
+    if params['average'] == 'macro' and len(class_wise):
+        cw = class_wise[0] if jk else class_wise
+        print("\nClass  F-score  DOA-Err  Dist-Err  RelDist-Err")
+        for c in range(params['nb_classes']):
+            print(f"  {c:2d}   {cw[0][c]:.2f}    {cw[1][c]:.1f}°    {cw[2][c]:.2f}     {cw[3][c]:.2f}")
