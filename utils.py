@@ -1,3 +1,8 @@
+# utils.py — Audio loading (librosa), spectrogram extraction, label processing, and evaluation helpers.
+# Audio/spectrogram: librosa https://librosa.org
+# GT/pred matching: scipy linear_sum_assignment (Hungarian algorithm) https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.linear_sum_assignment.html
+# Label format / ADPIT processing adapted from DCASE 2025 Task 3 baseline: https://github.com/sharathadavanne/seld-dcase2025
+
 import os
 import time
 import pickle

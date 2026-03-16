@@ -1,3 +1,7 @@
+# loss.py — ADPIT loss for Multi-ACCDOA SELD training.
+# Based on: Shimada et al., "Multi-ACCDOA", ICASSP 2022. https://arxiv.org/pdf/2110.07124.pdf
+# Adapted from the DCASE 2025 Task 3 baseline: https://github.com/sharathadavanne/seld-dcase2025
+
 import torch
 import torch.nn as nn
 

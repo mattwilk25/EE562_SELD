@@ -26,7 +26,7 @@ References:
   - DCASE 2025 Task 3 technical reports: Du_NERCSLIP (#1), He_HIT (#2),
     Banerjee_NTU (#3), Wu_HUST (#5)
 
-Author: Matt Wilk / Claude Code  —  March 2026
+Author: Matt Wilkinson —  March 2026
 """
 
 import torch
@@ -187,101 +187,39 @@ class SELDModelImproved(nn.Module):
             for _ in range(n_conformer)
         ])
 
-        # ------------------------------------------------------------------- #
-        # Audio-visual fusion (same design as baseline)
-        # ------------------------------------------------------------------- #
-        if params['modality'] == 'audio_visual':
-            self.visual_proj = nn.Linear(params['resnet_feature_size'], d_model)
-            dec_layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=n_heads,
-                                                   batch_first=True)
-            self.av_decoder = nn.TransformerDecoder(dec_layer,
-                                                    num_layers=params['nb_transformer_layers'])
-
-        # ------------------------------------------------------------------- #
-        # Output head (same output dims as SELDModel)
-        # ------------------------------------------------------------------- #
-        if params['multiACCDOA']:
-            out_dim = params['max_polyphony'] * (4 if params['modality'] == 'audio_visual' else 3) * params['nb_classes']
-        else:
-            out_dim = (4 if params['modality'] == 'audio_visual' else 3) * params['nb_classes']
-
+        # Output head: 3 tracks × (x, y, dist) × nb_classes = 117 values per frame
+        out_dim = params['max_polyphony'] * 3 * params['nb_classes']
         self.output_head = nn.Linear(d_model, out_dim)
         self.doa_act     = nn.Tanh()
         self.dist_act    = nn.ReLU()
-        if params['modality'] == 'audio_visual':
-            self.onscreen_act = nn.Sigmoid()
 
-    def forward(self, audio_feat, vid_feat=None):
-        """
-        audio_feat : (B, 2, T_in, F)  e.g. (B, 2, 251, 64)
-        vid_feat   : (B, 50, 7, 7) or None
-        Returns    : same shape as SELDModel
-        """
+    def forward(self, x):
         # ResNet encoder
-        x = self.stem(audio_feat)   # B × 64  × T × F
-        x = self.stage1(x)          # B × 64  × 50 × 16
-        x = self.stage2(x)          # B × 128 × 50 × 4
-        x = self.stage3(x)          # B × 256 × 50 × 2
+        x = self.stem(x)      # B × 64  × T × F
+        x = self.stage1(x)    # B × 64  × 50 × 16
+        x = self.stage2(x)    # B × 128 × 50 × 4
+        x = self.stage3(x)    # B × 256 × 50 × 2
 
-        # Flatten freq, reshape to (B, T, C*F)
         B, C, T, F = x.shape
-        x = x.permute(0, 2, 1, 3).reshape(B, T, C * F)  # B × 50 × 512
+        x = x.permute(0, 2, 1, 3).reshape(B, T, C * F)
+        x = self.proj(x)      # B × 50 × d_model
 
-        # Project to d_model
-        x = self.proj(x)            # B × 50 × d_model
-
-        # Conformer
         for block in self.conformer:
             x = block(x)
 
-        # Audio-visual fusion
-        if vid_feat is not None:
-            v = vid_feat.view(vid_feat.shape[0], vid_feat.shape[1], -1)
-            v = self.visual_proj(v)
-            x = self.av_decoder(x, v)
-
-        # Output head + activations (identical reshape logic to SELDModel)
-        pred = self.output_head(x)
-        B, T, _ = pred.shape
         nb_cls = self.params['nb_classes']
-
-        if self.params['modality'] == 'audio':
-            if self.params['multiACCDOA']:
-                pred = pred.reshape(B, T, 3, 3, nb_cls)
-                doa  = self.doa_act(pred[:, :, :, 0:2, :])
-                dist = self.dist_act(pred[:, :, :, 2:3, :])
-                pred = torch.cat((doa, dist), dim=3).reshape(B, T, -1)
-            else:
-                pred = pred.reshape(B, T, 3, nb_cls)
-                doa  = self.doa_act(pred[:, :, 0:2, :])
-                dist = self.dist_act(pred[:, :, 2:3, :])
-                pred = torch.cat((doa, dist), dim=2).reshape(B, T, -1)
-        else:  # audio_visual
-            if self.params['multiACCDOA']:
-                pred = pred.reshape(B, T, 3, 4, nb_cls)
-                doa  = self.doa_act(pred[:, :, :, 0:2, :])
-                dist = self.dist_act(pred[:, :, :, 2:3, :])
-                onsc = self.onscreen_act(pred[:, :, :, 3:4, :])
-                pred = torch.cat((doa, dist, onsc), dim=3).reshape(B, T, -1)
-            else:
-                pred = pred.reshape(B, T, 4, nb_cls)
-                doa  = self.doa_act(pred[:, :, 0:2, :])
-                dist = self.dist_act(pred[:, :, 2:3, :])
-                onsc = self.onscreen_act(pred[:, :, 3:4, :])
-                pred = torch.cat((doa, dist, onsc), dim=2).reshape(B, T, -1)
-
-        return pred
+        pred = self.output_head(x).reshape(B, T, 3, 3, nb_cls)
+        doa  = self.doa_act(pred[:, :, :, :2, :])
+        dist = self.dist_act(pred[:, :, :, 2:, :])
+        return torch.cat((doa, dist), dim=3).reshape(B, T, -1)
 
 
 if __name__ == '__main__':
-    from parameters import params
-    params['multiACCDOA'] = True
-    params['modality'] = 'audio'
-
+    params = {
+        'nb_mels': 64, 'nb_classes': 13, 'max_polyphony': 3, 'dropout': 0.05,
+        'f_pool_size': [4, 4, 2], 't_pool_size': [5, 1, 1],
+    }
     model = SELDModelImproved(params)
-    total = sum(p.numel() for p in model.parameters())
-    print(f'Parameters: {total:,}')
-
-    audio = torch.rand(4, 2, 251, 64)
-    out   = model(audio)
+    print(f'Parameters: {sum(p.numel() for p in model.parameters()):,}')
+    out = model(torch.rand(4, 2, 251, 64))
     print(f'Output shape: {out.shape}')   # expect (4, 50, 117)

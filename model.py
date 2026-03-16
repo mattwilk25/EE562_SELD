@@ -1,3 +1,7 @@
+# model.py — Baseline CRNN for stereo SELD (audio-only, Multi-ACCDOA output).
+# Architecture: SELDnet (Adavanne et al., JSTSP 2018) https://arxiv.org/pdf/1807.00129.pdf
+# Adapted from the DCASE 2025 Task 3 baseline: https://github.com/sharathadavanne/seld-dcase2025
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
