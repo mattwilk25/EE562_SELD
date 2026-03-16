@@ -169,6 +169,46 @@ This will store the predictions on the eval dataset in the output folder in the 
 5. [Daniel Aleksander Krause, Archontis Politis, Annamaria Mesaros, "Sound Event Detection and Localization with Distance Estimation" in arXiv: 2403.11827](https://arxiv.org/abs/2403.11827)
 6. [Annamaria Mesaros, Sharath Adavanne, Archontis Politis, Toni Heittola, and Tuomas Virtanen, "Joint Measurement of Localization and Detection of Sound Events", IEEE Workshop on Applications of Signal Processing to Audio and Acoustics (WASPAA 2019)](https://ieeexplore.ieee.org/document/8937220)
 
+---
+
+## Model 3: Dual-Branch ResNet Conformer (StereoRCnet)
+
+A dual-branch architecture that processes left and right stereo channels independently through shared-weight MCSANet encoders before fusing them with Attentional Feature Fusion (AFF).
+
+<p align="center">
+   <img src="images/StereoRCnet_architecture.png" width="500" title="Dual-Branch ResNet Conformer Architecture">
+</p>
+
+### Key Design Choices
+- **Dual-branch stereo processing**: Left and right channels each get their own ResNet-style encoder with Multi-Scale Channel-Spatial Attention (MCSA)
+- **Frequency-only pooling**: All 251 time frames are preserved through the CNN; temporal compression (251→50) happens only after the Conformer
+- **Attentional Feature Fusion**: Learns position-wise weights to combine left/right features, capturing interaural level differences
+
+### Running
+```bash
+cd StereoRCnet
+python train.py
+```
+
+### Results (Dev-Test)
+| Metric | Value |
+|---|---|
+| F-score (F<sub>20°</sub>) | 20.2% |
+| DOA Error | 24.6° |
+| Distance Error | 54.36 cm |
+| Rel. Distance Error | 0.30 |
+| Parameters | 6.7M |
+
+### Code Structure
+- `model.py` — StereoRCnet architecture (MCSANet + AFF + Conformer)
+- `config.py` — All hyperparameters
+- `train.py` — Training loop with AMP, gradient accumulation, early stopping
+- `dataset.py` — Data loading with ACCDOA label conversion
+- `augment.py` — SpecAugment, frequency shift, random cutout, AugMix
+- `loss.py` — SELD loss (DOA MSE + distance MSPE)
+- `evaluate.py` — Evaluation with optional dynamic thresholds
+- `inference.py` — Inference on evaluation set
+
 ## License
 
 This repo and its contents have the MIT License.
