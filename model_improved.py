@@ -1,32 +1,5 @@
 """
-model_improved.py
-
-ResNet-Conformer SELD model — drop-in replacement for model.py.
-
-Architecture based on top DCASE 2025 Task 3 submissions (Rank 1-5):
-  - ResNet encoder:    3 stages of residual blocks replace the plain ConvBlocks.
-                       Residual connections give better gradient flow and richer features.
-  - Conformer layers:  Replace BiGRU + MHSA. Each Conformer block captures both local
-                       (depthwise conv) and global (MHSA) temporal patterns in one block.
-
-Input / output interface is identical to SELDModel in model.py — swap the import
-in main.py to use this model:
-
-    from model_improved import SELDModelImproved as SELDModel
-
-New parameters (add to params dict, or leave out to use defaults):
-    'rc_d_model':       int  — Conformer hidden dim.          Default: 256
-    'rc_n_heads':       int  — MHSA heads in Conformer.       Default: 8
-    'rc_ff_dim':        int  — Feedforward inner dim.         Default: 512
-    'rc_nb_conformer':  int  — Number of Conformer blocks.    Default: 4
-    'rc_conv_kernel':   int  — Depthwise conv kernel size.    Default: 31
-
-References:
-  - Gulati et al. "Conformer: Convolution-augmented Transformer" (2020)
-  - DCASE 2025 Task 3 technical reports: Du_NERCSLIP (#1), He_HIT (#2),
-    Banerjee_NTU (#3), Wu_HUST (#5)
-
-Author: Matt Wilkinson —  March 2026
+ResNet-Conformer SELD model 
 """
 
 import torch
